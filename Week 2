@@ -1,0 +1,261 @@
+# Module 2
+
+# 0) Setup & Imports
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Plotly
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+pd.set_option("display.max_columns", 50)
+
+# 1) Robust Load
+ABS_TITANIC = Path(r"C:\Users\prj89\OneDrive\Desktop\Academics\NU\ANA 500 Python for Data Science\Week 1\titanic Dataset.csv")
+
+def load_titanic():
+    if ABS_TITANIC.exists():
+        print(f"Loaded CSV via OneDrive path: {ABS_TITANIC}")
+        return pd.read_csv(ABS_TITANIC)
+
+    for p in [Path("./titanic.csv"), Path("./titanic Dataset.csv"), Path("./data/titanic.csv"), Path("./datasets/titanic.csv")]:
+        if p.exists():
+            print(f"Loaded local CSV: {p}")
+            return pd.read_csv(p)
+
+    try:
+        import seaborn as sns
+        df = sns.load_dataset("titanic")
+        print("Loaded Titanic via seaborn.load_dataset('titanic')")
+        return df
+    except Exception as e:
+        print("Could not load via seaborn:", e)
+
+    raise FileNotFoundError("Titanic CSV not found — place a local titanic.csv or update ABS_TITANIC.")
+
+df_raw = load_titanic()
+
+# 2) Clean
+df = df_raw.copy()
+df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
+
+# Normalize core columns
+if "pclass" in df.columns:
+    df["pclass"] = pd.to_numeric(df["pclass"], errors="coerce").astype("Int64")
+elif "class" in df.columns:
+    df.rename(columns={"class": "pclass"}, inplace=True)
+    # seaborn 'class' is categorical like 'First', 'Second', 'Third'
+    mapping = {"First": 1, "Second": 2, "Third": 3}
+    df["pclass"] = df["pclass"].map(mapping).astype("Int64")
+
+if "survived" in df.columns:
+    if df["survived"].dtype == "object":
+        _sv_map = {"yes": 1, "y": 1, "true": 1, "t": 1, "1": 1,
+                   "no": 0, "n": 0, "false": 0, "f": 0, "0": 0}
+        df["survived"] = df["survived"].astype(str).str.strip().str.lower().map(_sv_map).astype("Int64")
+    else:
+        df["survived"] = pd.to_numeric(df["survived"], errors="coerce").astype("Int64")
+
+for col in ["sex", "embarked"]:
+    if col in df.columns:
+        df[col] = df[col].astype("category")
+
+# Impute essential numeric fields for plots
+if "age" in df.columns:
+    df["age"] = pd.to_numeric(df["age"], errors="coerce")
+    if {"sex", "pclass"}.issubset(df.columns):
+        df["age"] = df["age"].fillna(df.groupby(["sex","pclass"])["age"].transform("median"))
+    df["age"] = df["age"].fillna(df["age"].median())
+
+if "fare" in df.columns:
+    df["fare"] = pd.to_numeric(df["fare"], errors="coerce")
+    if "pclass" in df.columns:
+        df["fare"] = df["fare"].fillna(df.groupby("pclass")["fare"].transform("median"))
+    df["fare"] = df["fare"].fillna(df["fare"].median())
+
+# Add features
+if {"sibsp","parch"}.issubset(df.columns):
+    df["sibsp"] = pd.to_numeric(df["sibsp"], errors="coerce").fillna(0).astype("Int64")
+    df["parch"] = pd.to_numeric(df["parch"], errors="coerce").fillna(0).astype("Int64")
+    df["family_size"] = (df["sibsp"] + df["parch"] + 1).astype("Int64")
+    df["is_alone"] = (df["family_size"] == 1).astype("Int64")
+
+    # 3) Matplotlib Visuals (static)
+# 3.1 Histogram: Age
+plt.figure()
+plt.hist(df["age"].dropna(), bins=30)
+plt.title("Age Distribution")
+plt.xlabel("Age"); plt.ylabel("Count")
+plt.tight_layout(); plt.show()
+
+# 3.2 Histogram: Fare (log-scaled x if desired)
+plt.figure()
+plt.hist(df["fare"].dropna(), bins=40)
+plt.title("Fare Distribution")
+plt.xlabel("Fare"); plt.ylabel("Count")
+plt.tight_layout(); plt.show()
+
+# 3.3 Bar: Survival Rate by Sex
+if {"survived","sex"}.issubset(df.columns):
+    rate_by_sex = df.groupby("sex")["survived"].mean().sort_values(ascending=False)
+    plt.figure()
+    rate_by_sex.plot(kind="bar")
+    plt.title("Survival Rate by Sex")
+    plt.xlabel("Sex"); plt.ylabel("Survival Rate"); plt.ylim(0,1)
+    plt.tight_layout(); plt.show()
+
+# 3.4 Bar: Survival Rate by Pclass
+if {"survived","pclass"}.issubset(df.columns):
+    rate_by_class = df.groupby("pclass")["survived"].mean().sort_index()
+    plt.figure()
+    rate_by_class.plot(kind="bar")
+    plt.title("Survival Rate by Passenger Class")
+    plt.xlabel("Pclass"); plt.ylabel("Survival Rate"); plt.ylim(0,1)
+    plt.tight_layout(); plt.show()
+
+# 3.5 Grouped Bar (Pclass grouped by Sex): Survival Rate
+if {"survived","sex","pclass"}.issubset(df.columns):
+    pivot = pd.pivot_table(df, values="survived", index="pclass", columns="sex", aggfunc="mean").sort_index()
+    plt.figure()
+    pivot.plot(kind="bar")
+    plt.title("Survival Rate by Pclass (grouped by Sex)")
+    plt.xlabel("Pclass"); plt.ylabel("Survival Rate"); plt.ylim(0,1)
+    plt.tight_layout(); plt.show()
+
+# 3.6 Boxplot: Fare by Pclass
+if {"fare","pclass"}.issubset(df.columns):
+    classes = [c for c in sorted(df["pclass"].dropna().unique())]
+    data = [df.loc[df["pclass"] == c, "fare"].dropna() for c in classes]
+    plt.figure()
+    plt.boxplot(data, tick_labels=[str(c) for c in classes], showfliers=True)
+    plt.title("Fare by Pclass")
+    plt.xlabel("Pclass"); plt.ylabel("Fare")
+    plt.tight_layout(); plt.show()
+
+# 3.7 Scatter: Age vs Fare colored by Survived
+if {"age","fare","survived"}.issubset(df.columns):
+    plt.figure()
+    plt.scatter(df["age"], df["fare"], c=df["survived"], alpha=0.6)
+    plt.title("Age vs Fare (color = Survived)")
+    plt.xlabel("Age"); plt.ylabel("Fare")
+    plt.tight_layout(); plt.show()
+
+# 3.8 Correlation Heatmap (numeric only)
+num_cols = df.select_dtypes(include=["number"]).columns
+corr = df[num_cols].corr()
+plt.figure()
+plt.imshow(corr, interpolation="nearest")
+plt.title("Correlation Heatmap (numeric)")
+plt.xticks(range(len(num_cols)), num_cols, rotation=45, ha="right")
+plt.yticks(range(len(num_cols)), num_cols)
+plt.colorbar()
+plt.tight_layout(); plt.show()
+
+# 4) Plotly Visuals (interactive)
+# 4.1 Interactive Histogram: Age
+fig = px.histogram(df, x="age", nbins=30, title="Age Distribution (Interactive)")
+fig.update_layout(bargap=0.05)
+fig.show()
+
+# 4.2 Interactive Histogram: Fare
+fig = px.histogram(df, x="fare", nbins=40, title="Fare Distribution (Interactive)")
+fig.update_layout(bargap=0.05)
+fig.show()
+
+# 4.3 Interactive Bar: Survival Rate by Sex
+if {"survived","sex"}.issubset(df.columns):
+    rate_by_sex_df = df.groupby("sex", observed=True)["survived"].mean().reset_index()
+    fig = px.bar(rate_by_sex_df, x="sex", y="survived", title="Survival Rate by Sex (Interactive)", range_y=[0,1])
+    fig.update_traces(texttemplate="%{y:.2f}", textposition="outside")
+    fig.show()
+
+# 4.4 Interactive Bar: Survival Rate by Pclass
+if {"survived","pclass"}.issubset(df.columns):
+    rate_by_class_df = df.groupby("pclass", observed=True)["survived"].mean().reset_index().sort_values("pclass")
+    fig = px.bar(rate_by_class_df, x="pclass", y="survived", title="Survival Rate by Pclass (Interactive)", range_y=[0,1])
+    fig.update_traces(texttemplate="%{y:.2f}", textposition="outside")
+    fig.show()
+
+# 4.5 Interactive Grouped Bar: Survival Rate Sex × Pclass
+if {"survived","sex","pclass"}.issubset(df.columns):
+    rate_long = (df.groupby(["pclass","sex"], observed=True)["survived"].mean()
+                 .reset_index().sort_values(["pclass","sex"]))
+    fig = px.bar(rate_long, x="pclass", y="survived", color="sex",
+                 barmode="group", range_y=[0,1],
+                 title="Survival Rate by Pclass grouped by Sex (Interactive)")
+    fig.update_traces(texttemplate="%{y:.2f}", textposition="outside")
+    fig.show()
+
+# 4.6 Interactive Box: Fare by Pclass
+if {"fare","pclass"}.issubset(df.columns):
+    fig = px.box(df, x="pclass", y="fare", points="outliers", title="Fare by Pclass (Interactive)")
+    fig.show()
+
+# 4.7 Interactive Violin: Age by Sex, split by Survived
+if {"age","sex","survived"}.issubset(df.columns):
+    fig = px.violin(df, x="sex", y="age", color="survived", box=True, points="outliers",
+                    title="Age by Sex split by Survived (Interactive)")
+    fig.show()
+
+# 4.8 Interactive Scatter: Age vs Fare colored by Survived, faceted by Sex
+if {"age","fare","survived","sex"}.issubset(df.columns):
+    fig = px.scatter(df, x="age", y="fare", color="survived",
+                     facet_col="sex", facet_col_wrap=2,
+                     title="Age vs Fare colored by Survived — Faceted by Sex",
+                     hover_data=["pclass","family_size"] if "family_size" in df.columns else ["pclass"])
+    fig.update_traces(marker=dict(opacity=0.65))
+    fig.show()
+
+# 4.9 Interactive Heatmap: Correlation
+fig = go.Figure(data=go.Heatmap(
+    z=corr.values,
+    x=list(num_cols),
+    y=list(num_cols),
+    colorbar=dict(title="corr")
+))
+fig.update_layout(title="Correlation Heatmap (Interactive)")
+fig.show()
+
+# 5) Subplots Dashboard with Plotly
+# Combined small dashboard: 2x2 (Age hist, Fare box per class, Survival by Sex, Survival by Pclass)
+subplot_fig = make_subplots(
+    rows=2, cols=2,
+    subplot_titles=("Age Distribution", "Fare by Pclass", "Survival Rate by Sex", "Survival Rate by Pclass")
+)
+
+# Age hist
+subplot_fig.add_trace(go.Histogram(x=df["age"], nbinsx=30, name="Age"), row=1, col=1)
+
+# Fare by Pclass box
+if {"fare","pclass"}.issubset(df.columns):
+    for cl in sorted(df["pclass"].dropna().unique()):
+        subplot_fig.add_trace(
+            go.Box(y=df.loc[df["pclass"]==cl,"fare"], name=f"Class {cl}", boxpoints="outliers"),
+            row=1, col=2
+        )
+
+# Survival by Sex
+if {"survived","sex"}.issubset(df.columns):
+    rate_by_sex_df = df.groupby("sex", observed=True)["survived"].mean().reset_index()
+    subplot_fig.add_trace(
+        go.Bar(x=rate_by_sex_df["sex"], y=rate_by_sex_df["survived"], name="By Sex"),
+        row=2, col=1
+    )
+
+# Survival by Pclass
+if {"survived","pclass"}.issubset(df.columns):
+    rate_by_class_df = df.groupby("pclass", observed=True)["survived"].mean().reset_index().sort_values("pclass")
+    subplot_fig.add_trace(
+        go.Bar(x=rate_by_class_df["pclass"], y=rate_by_class_df["survived"], name="By Pclass"),
+        row=2, col=2
+    )
+
+subplot_fig.update_yaxes(range=[0,1], row=2, col=1)
+subplot_fig.update_yaxes(range=[0,1], row=2, col=2)
+subplot_fig.update_layout(height=800, width=1000, title_text="Titanic — Module 2 Visualization Dashboard")
+subplot_fig.show()
