@@ -1,0 +1,658 @@
+from pathlib import Path
+
+import os
+import json
+import math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from pathlib import Path
+from typing import Tuple, Dict
+
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    mean_squared_error, mean_absolute_error, r2_score,
+    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+)
+from sklearn.linear_model import LinearRegression
+
+import tensorflow as tf
+from tensorflow.keras import layers, callbacks, Model
+
+SEED = 42
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+#1. Configure
+
+DATA_PATH = r"C:\Users\prj89\OneDrive\Desktop\Academics\NU\ANA 500 Python for Data Science\Week 1\titanic Dataset.csv"
+
+df = load_data(DATA_PATH)
+num_cols, cat_cols = split_features(df)
+
+TARGET_NAME = "Survived"   
+VAL_SIZE    = 0.2
+TEST_SIZE   = 0.2
+BATCH_SIZE  = 64
+EPOCHS      = 100
+PATIENCE    = 10
+LR          = 1e-3
+
+OUT_DIR = Path("titanic_outputs")
+OUT_DIR.mkdir(exist_ok=True)
+
+
+# 2. Load
+
+def load_data(path: str) -> pd.DataFrame:
+    df = pd.read_csv(DATA_PATH)
+    # Try to find a "survival-like" target and rename to Survived
+    candidate_targets = ["Survived", "survived", "target", "Target", "Outcome", "Label", "label", "y"]
+    if TARGET_NAME not in df.columns:
+        for c in candidate_targets:
+            if c in df.columns:
+                df = df.rename(columns={c: TARGET_NAME})
+                break
+    if TARGET_NAME not in df.columns:
+        raise ValueError(f"Could not find '{TARGET_NAME}' or a recognizable target column in {path}. "
+                         f"Please ensure the dataset has a binary target and rename it to '{TARGET_NAME}'.")
+    return df
+
+# 3. Clean & Features
+
+def split_features(df: pd.DataFrame) -> Tuple[list, list]:
+    """Heuristic feature split for Titanic-like data."""
+    # Drop super-unique/high-cardinality text fields if present (e.g., Name, Ticket, Cabin)
+    drop_like = {"Name", "Ticket", "Cabin", "PassengerId"}
+    usable_cols = [c for c in df.columns if c != TARGET_NAME and c not in drop_like]
+
+    # Guess categorical vs numeric
+    cat_cols, num_cols = [], []
+    for c in usable_cols:
+        if pd.api.types.is_numeric_dtype(df[c]):
+            num_cols.append(c)
+        else:
+            cat_cols.append(c)
+
+    return num_cols, cat_cols
+
+# 4. Preprocessor
+
+def make_preprocessor(num_cols, cat_cols) -> ColumnTransformer:
+    num_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler())
+    ])
+    cat_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+    ])
+    pre = ColumnTransformer([
+        ("num", num_pipe, num_cols),
+        ("cat", cat_pipe, cat_cols)
+    ])
+    return pre
+
+# 5. Models
+
+def build_mlp_regressor(n_features: int) -> Model:
+    inp = layers.Input(shape=(n_features,), name="mlp_input")
+    x = layers.Dense(128, activation="relu")(inp)
+    x = layers.Dropout(0.2)(x)
+    x = layers.Dense(64, activation="relu")(x)
+    x = layers.Dropout(0.2)(x)
+    out = layers.Dense(1, activation="sigmoid")(x)  # sigmoid -> output in [0,1]
+    model = Model(inp, out, name="MLP_Regressor")
+    model.compile(optimizer=tf.keras.optimizers.Adam(LR), loss="mse", metrics=["mae"])
+    return model
+
+
+def build_rnn_regressor(n_features: int, cell: str = "lstm") -> Model:
+    """Treat features as a sequence of timesteps with 1 feature at each step: (n_features,) -> (n_features, 1)."""
+    inp = layers.Input(shape=(n_features, 1), name=f"{cell}_input")
+    if cell.lower() == "gru":
+        x = layers.GRU(64, return_sequences=False)(inp)
+    else:
+        x = layers.LSTM(64, return_sequences=False)(inp)
+    x = layers.Dropout(0.3)(x)
+    x = layers.Dense(32, activation="relu")(x)
+    out = layers.Dense(1, activation="sigmoid")(x)
+    model = Model(inp, out, name=f"{cell.upper()}_Regressor")
+    model.compile(optimizer=tf.keras.optimizers.Adam(LR), loss="mse", metrics=["mae"])
+    return model
+
+# 6. Metrics
+
+def regression_and_classification_metrics(y_true: np.ndarray, y_pred_prob: np.ndarray, threshold: float = 0.5) -> Dict:
+    y_pred = (y_pred_prob >= threshold).astype(int)
+    rmse = mean_squared_error(y_true, y_pred_prob, squared=False)
+    mae  = mean_absolute_error(y_true, y_pred_prob)
+    r2   = r2_score(y_true, y_pred_prob)
+
+    # guard for constant predictions / single-class y
+    try:
+        auc = roc_auc_score(y_true, y_pred_prob)
+    except Exception:
+        auc = float("nan")
+    try:
+        acc = accuracy_score(y_true, y_pred)
+        prec = precision_score(y_true, y_pred, zero_division=0)
+        rec = recall_score(y_true, y_pred, zero_division=0)
+        f1  = f1_score(y_true, y_pred, zero_division=0)
+    except Exception:
+        acc = prec = rec = f1 = float("nan")
+
+    return {
+        "rmse": rmse, "mae": mae, "r2": r2,
+        "accuracy@0.5": acc, "precision@0.5": prec, "recall@0.5": rec, "f1@0.5": f1,
+        "roc_auc": auc
+    }
+
+
+def plot_history(hist, title: str, out_path: Path):
+    plt.figure()
+    plt.plot(hist.history.get("loss", []), label="train_loss")
+    if "val_loss" in hist.history:
+        plt.plot(hist.history["val_loss"], label="val_loss")
+    plt.title(title)
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss (MSE)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
+# 7. Main
+
+def main():
+    print(f"Loading data from: {DATA_PATH}")
+    df = load_data(DATA_PATH)
+
+    # Ensure target is 0/1 numeric
+    if not pd.api.types.is_numeric_dtype(df[TARGET_NAME]):
+        # Map common strings to 0/1 if needed
+        mapping = {"no": 0, "yes": 1, "false": 0, "true": 1, "died": 0, "survived": 1}
+        df[TARGET_NAME] = df[TARGET_NAME].astype(str).str.lower().map(mapping).astype(float)
+
+    # Drop rows without target
+    df = df.dropna(subset=[TARGET_NAME]).copy()
+
+    # Feature lists
+    num_cols, cat_cols = split_features(df)
+    print("Numeric columns:", num_cols)
+    print("Categorical columns:", cat_cols)
+
+# --- CLEAN TARGET 'Survived' TO 0/1 AND DROP NaNs ---
+
+
+# Try numeric conversion
+t = df[TARGET_NAME]
+
+t_num = pd.to_numeric(t, errors="coerce")  # numeric where possible, NaN otherwise
+
+# Map common strings to 0/1 for non-numeric entries
+mapping = {
+    "yes": 1, "true": 1, "survived": 1, "y": 1, "1": 1, "t": 1,
+    "no": 0, "false": 0, "died": 0, "n": 0, "0": 0, "f": 0
+}
+t_str_mapped = (
+    t.astype(str).str.strip().str.lower()
+    .replace({"": np.nan})
+    .map(mapping)
+)
+
+# Combine: prefer numeric where available, else string map
+t_clean = t_num.copy()
+t_clean[t_num.isna()] = t_str_mapped[t_num.isna()]
+
+# Finalize target: must be 0/1 and finite; drop rows where still NaN
+df[TARGET_NAME] = t_clean.astype(float)
+before = len(df)
+df = df.dropna(subset=[TARGET_NAME]).copy()
+after = len(df)
+
+#  clip to [0,1] just in case
+df[TARGET_NAME] = df[TARGET_NAME].clip(0, 1)
+
+print(f"Dropped {before - after} rows with missing target after cleaning.")
+print("Target value counts:")
+print(df[TARGET_NAME].value_counts(dropna=False))
+
+Selection deleted
+# --- CLEAN TARGET 'Survived' TO 0/1 AND DROP NaNs ---
+
+
+# Try numeric conversion
+t = df[TARGET_NAME]
+
+t_num = pd.to_numeric(t, errors="coerce")  # numeric where possible, NaN otherwise
+
+# Map common strings to 0/1 for non-numeric entries
+mapping = {
+    "yes": 1, "true": 1, "survived": 1, "y": 1, "1": 1, "t": 1,
+    "no": 0, "false": 0, "died": 0, "n": 0, "0": 0, "f": 0
+}
+t_str_mapped = (
+    t.astype(str).str.strip().str.lower()
+    .replace({"": np.nan})
+    .map(mapping)
+)
+
+# Combine: prefer numeric where available, else string map
+t_clean = t_num.copy()
+t_clean[t_num.isna()] = t_str_mapped[t_num.isna()]
+
+# Finalize target: must be 0/1 and finite; drop rows where still NaN
+df[TARGET_NAME] = t_clean.astype(float)
+before = len(df)
+df = df.dropna(subset=[TARGET_NAME]).copy()
+after = len(df)
+
+#  clip to [0,1] just in case
+df[TARGET_NAME] = df[TARGET_NAME].clip(0, 1)
+
+print(f"Dropped {before - after} rows with missing target after cleaning.")
+print("Target value counts:")
+print(df[TARGET_NAME].value_counts(dropna=False))
+Dropped 0 rows with missing target after cleaning.
+Target value counts:
+Survived
+0.0    549
+1.0    342
+Name: count, dtype: int64
+
+print("Any NaN left in y?", np.isnan(df[TARGET_NAME]).any())
+print("Rows with NaN in target:")
+print(df[df[TARGET_NAME].isna()].head())
+
+Any NaN left in y? False
+Rows with NaN in target:
+Empty DataFrame
+Columns: [PassengerId, Survived, Pclass, Name, Sex, Age, SibSp, Parch, Ticket, Fare, Cabin, Embarked]
+Index: []
+
+# Shapes & finiteness checks
+print("X_train_proc:", X_train_proc.shape, "X_val_proc:", X_val_proc.shape, "X_test_proc:", X_test_proc.shape)
+print("y_train:", y_train.shape, "y_val:", y_val.shape, "y_test:", y_test.shape)
+
+import numpy as np
+def all_finite(arr, name):
+    ok = np.isfinite(arr).all()
+    print(f"{name} all finite? {ok}")
+    return ok
+
+all_finite(X_train_proc, "X_train_proc")
+all_finite(X_val_proc,   "X_val_proc")
+all_finite(X_test_proc,  "X_test_proc")
+all_finite(y_train,      "y_train")
+all_finite(y_val,        "y_val")
+all_finite(y_test,       "y_test")
+
+X_train_proc: (569, 10) X_val_proc: (143, 10) X_test_proc: (179, 10)
+y_train: (569,) y_val: (143,) y_test: (179,)
+X_train_proc all finite? True
+X_val_proc all finite? True
+X_test_proc all finite? True
+y_train all finite? True
+y_val all finite? True
+y_test all finite? True
+np.True_
+
+# 8. Train & BLR
+
+# Train/Val/Test split
+X = df[num_cols + cat_cols]
+y = df[TARGET_NAME].astype(float).values
+
+X_temp, X_test, y_temp, y_test = train_test_split(
+    X, y, test_size=TEST_SIZE, random_state=SEED,
+    stratify=(y if len(np.unique(y)) == 2 else None)
+)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_temp, y_temp, test_size=VAL_SIZE, random_state=SEED,
+    stratify=(y_temp if len(np.unique(y_temp)) == 2 else None)
+)
+
+# Preprocessor
+pre = make_preprocessor(num_cols, cat_cols)
+X_train_proc = pre.fit_transform(X_train)
+X_val_proc   = pre.transform(X_val)
+X_test_proc  = pre.transform(X_test)
+
+n_features = X_train_proc.shape[1]
+print("Final feature count after preprocessing:", n_features)
+
+Final feature count after preprocessing: 10
+
+def regression_and_classification_metrics(y_true, y_pred_prob, threshold=0.5):
+    y_pred = (y_pred_prob >= threshold).astype(int)
+    
+    mse  = mean_squared_error(y_true, y_pred_prob)
+    rmse = np.sqrt(mse)
+    mae  = mean_absolute_error(y_true, y_pred_prob)
+    r2   = r2_score(y_true, y_pred_prob)
+    
+    try:
+        auc = roc_auc_score(y_true, y_pred_prob)
+    except Exception:
+        auc = float("nan")
+    try:
+        acc = accuracy_score(y_true, y_pred)
+        prec = precision_score(y_true, y_pred, zero_division=0)
+        rec = recall_score(y_true, y_pred, zero_division=0)
+        f1  = f1_score(y_true, y_pred, zero_division=0)
+    except Exception:
+        acc = prec = rec = f1 = float("nan")
+
+    return {
+        "rmse": rmse, "mae": mae, "r2": r2,
+        "accuracy@0.5": acc, "precision@0.5": prec,
+        "recall@0.5": rec, "f1@0.5": f1, "roc_auc": auc
+    }
+
+# 9. MLP, RNN, & LSTM
+
+mlp = build_mlp_regressor(n_features)
+es = callbacks.EarlyStopping(monitor="val_loss", patience=PATIENCE, restore_best_weights=True)
+hist_mlp = mlp.fit(
+    X_train_proc, y_train,
+    validation_data=(X_val_proc, y_val),
+    epochs=EPOCHS, batch_size=BATCH_SIZE, callbacks=[es], verbose=0
+)
+plot_history(hist_mlp, "MLP Training Curve", OUT_DIR / "mlp_training_curve.png")
+
+mlp_val_pred  = mlp.predict(X_val_proc, verbose=0).ravel()
+mlp_test_pred = mlp.predict(X_test_proc, verbose=0).ravel()
+m_mlp_val  = regression_and_classification_metrics(y_val, mlp_val_pred)
+m_mlp_test = regression_and_classification_metrics(y_test, mlp_test_pred)
+print("\n[MLP] VAL:", m_mlp_val)
+print("[MLP] TEST:", m_mlp_test)
+
+# ===== RNN Regressors (LSTM & GRU) =====
+# Reshape: (N, n_features) -> (N, n_features, 1)
+X_train_seq = X_train_proc[..., None]
+X_val_seq   = X_val_proc[..., None]
+X_test_seq  = X_test_proc[..., None]
+
+# LSTM
+lstm = build_rnn_regressor(n_features, cell="lstm")
+hist_lstm = lstm.fit(
+    X_train_seq, y_train,
+    validation_data=(X_val_seq, y_val),
+    epochs=EPOCHS, batch_size=BATCH_SIZE, callbacks=[es], verbose=0
+)
+plot_history(hist_lstm, "LSTM Training Curve", OUT_DIR / "lstm_training_curve.png")
+
+lstm_val_pred  = lstm.predict(X_val_seq, verbose=0).ravel()
+lstm_test_pred = lstm.predict(X_test_seq, verbose=0).ravel()
+m_lstm_val  = regression_and_classification_metrics(y_val, lstm_val_pred)
+m_lstm_test = regression_and_classification_metrics(y_test, lstm_test_pred)
+print("\n[LSTM] VAL:", m_lstm_val)
+print("[LSTM] TEST:", m_lstm_test)
+
+[MLP] VAL: {'rmse': np.float64(0.3618269299100361), 'mae': 0.23885718300625994, 'r2': 0.44686837754568365, 'accuracy@0.5': 0.8391608391608392, 'precision@0.5': 0.8478260869565217, 'recall@0.5': 0.7090909090909091, 'f1@0.5': 0.7722772277227723, 'roc_auc': np.float64(0.8457644628099172)}
+[MLP] TEST: {'rmse': np.float64(0.380127605405788), 'mae': 0.26957591046064094, 'r2': 0.3900094517284213, 'accuracy@0.5': 0.7932960893854749, 'precision@0.5': 0.82, 'recall@0.5': 0.5942028985507246, 'f1@0.5': 0.6890756302521008, 'roc_auc': np.float64(0.846772068511199)}
+
+[LSTM] VAL: {'rmse': np.float64(0.49287736656149916), 'mae': 0.4919043406323119, 'r2': -0.02637121602982817, 'accuracy@0.5': 0.6153846153846154, 'precision@0.5': 0.0, 'recall@0.5': 0.0, 'f1@0.5': 0.0, 'roc_auc': np.float64(0.606301652892562)}
+[LSTM] TEST: {'rmse': np.float64(0.4934000657276174), 'mae': 0.4924149223546076, 'r2': -0.02769132860867063, 'accuracy@0.5': 0.6145251396648045, 'precision@0.5': 0.0, 'recall@0.5': 0.0, 'f1@0.5': 0.0, 'roc_auc': np.float64(0.5520421607378129)}
+
+# 10. GRU
+
+gru = build_rnn_regressor(n_features, cell="gru")
+hist_gru = gru.fit(
+    X_train_seq, y_train,
+    validation_data=(X_val_seq, y_val),
+    epochs=EPOCHS, batch_size=BATCH_SIZE, callbacks=[es], verbose=0
+)
+plot_history(hist_gru, "GRU Training Curve", OUT_DIR / "gru_training_curve.png")
+
+gru_val_pred  = gru.predict(X_val_seq, verbose=0).ravel()
+gru_test_pred = gru.predict(X_test_seq, verbose=0).ravel()
+m_gru_val  = regression_and_classification_metrics(y_val, gru_val_pred)
+m_gru_test = regression_and_classification_metrics(y_test, gru_test_pred)
+print("\n[GRU] VAL:", m_gru_val)
+print("[GRU] TEST:", m_gru_test)
+
+[GRU] VAL: {'rmse': np.float64(0.48658491072623794), 'mae': 0.4827212864285582, 'r2': -0.0003315983387974786, 'accuracy@0.5': 0.6153846153846154, 'precision@0.5': 0.0, 'recall@0.5': 0.0, 'f1@0.5': 0.0, 'roc_auc': np.float64(0.678202479338843)}
+[GRU] TEST: {'rmse': np.float64(0.48840613071157923), 'mae': 0.4845187733959219, 'r2': -0.006993111333620794, 'accuracy@0.5': 0.6145251396648045, 'precision@0.5': 0.0, 'recall@0.5': 0.0, 'f1@0.5': 0.0, 'roc_auc': np.float64(0.6047430830039525)}
+
+for var in ["m_lin_test", "m_mlp_test", "m_lstm_test", "m_gru_test"]:
+    print(var, "exists?" , var in globals())
+
+m_lin_test exists? False
+m_mlp_test exists? True
+m_lstm_test exists? True
+m_gru_test exists? True
+
+# 11. Summary (robust to missing models)
+
+rows = []
+order = [
+    ("LinearRegression", "m_lin_test"),
+    ("MLP",              "m_mlp_test"),
+    ("LSTM",             "m_lstm_test"),
+    ("GRU",              "m_gru_test"),
+]
+
+for label, varname in order:
+    if varname in globals():
+        rows.append({"model": label, **globals()[varname]})
+    else:
+        print(f"[info] Skipping {label}: '{varname}' not found (did that cell run?)")
+
+if rows:
+    summary = pd.DataFrame(rows).set_index("model")
+    print("\n=== TEST SUMMARY ===")
+    print(summary.round(4))
+else:
+    print("No models available to summarize. Re-run the training cells first.")
+
+[info] Skipping LinearRegression: 'm_lin_test' not found (did that cell run?)
+
+=== TEST SUMMARY ===
+         rmse     mae      r2  accuracy@0.5  precision@0.5  recall@0.5  \
+model                                                                    
+MLP    0.3801  0.2696  0.3900        0.7933           0.82      0.5942   
+LSTM   0.4934  0.4924 -0.0277        0.6145           0.00      0.0000   
+GRU    0.4884  0.4845 -0.0070        0.6145           0.00      0.0000   
+
+       f1@0.5  roc_auc  
+model                   
+MLP    0.6891   0.8468  
+LSTM   0.0000   0.5520  
+GRU    0.0000   0.6047  
+
+# --- Repair any missing VAL metrics, then save summaries safely ---
+
+# Ensure sequence arrays exist
+if 'X_val_seq' not in globals():
+    X_val_seq = X_val_proc[..., None]
+if 'X_test_seq' not in globals():
+    X_test_seq = X_test_proc[..., None]
+
+def ensure_metric(varname, compute_fn):
+    if varname not in globals():
+        try:
+            globals()[varname] = compute_fn()
+            print(f"[built] {varname}")
+        except Exception as e:
+            print(f"[skip]  {varname}: {e}")
+
+# Rebuild VAL metrics if missing
+ensure_metric("m_lin_val",  lambda: regression_and_classification_metrics(
+    y_val, LinearRegression().fit(X_train_proc, y_train).predict(X_val_proc).clip(0,1))
+)
+
+if 'linreg' in globals():
+    ensure_metric("m_lin_val",  lambda: regression_and_classification_metrics(
+        y_val, linreg.predict(X_val_proc).clip(0,1))
+    )
+
+if 'mlp' in globals():
+    ensure_metric("m_mlp_val",  lambda: regression_and_classification_metrics(
+        y_val, mlp.predict(X_val_proc, verbose=0).ravel())
+    )
+
+if 'lstm' in globals():
+    ensure_metric("m_lstm_val", lambda: regression_and_classification_metrics(
+        y_val, lstm.predict(X_val_seq, verbose=0).ravel())
+    )
+
+if 'gru' in globals():
+    ensure_metric("m_gru_val",  lambda: regression_and_classification_metrics(
+        y_val, gru.predict(X_val_seq, verbose=0).ravel())
+    )
+
+[built] m_lin_val
+
+# Save summary
+summary.to_csv(OUT_DIR / "test_summary.csv", index=True)
+
+# Dump a JSON with VAL metrics
+val_summary = {
+    "LinearRegression": m_lin_val,
+    "MLP": m_mlp_val,
+    "LSTM": m_lstm_val,
+    "GRU": m_gru_val
+}
+with open(OUT_DIR / "val_summary.json", "w") as f:
+    json.dump(val_summary, f, indent=2)
+
+print(f"\nArtifacts saved to: {OUT_DIR.resolve()}")
+print(" - mlp_training_curve.png")
+print(" - lstm_training_curve.png")
+print(" - gru_training_curve.png")
+print(" - test_summary.csv")
+print(" - val_summary.json")
+
+Artifacts saved to: C:\Users\prj89\titanic_outputs
+ - mlp_training_curve.png
+ - lstm_training_curve.png
+ - gru_training_curve.png
+ - test_summary.csv
+ - val_summary.json
+
+import os
+print("\n".join(sorted(os.listdir(OUT_DIR))))
+
+gru_training_curve.png
+lstm_training_curve.png
+mlp_training_curve.png
+test_summary.csv
+val_summary.json
+
+# === RESULTS REPORT ===
+import pandas as pd
+from pathlib import Path
+
+REPORT_DIR = OUT_DIR if 'OUT_DIR' in globals() else Path("titanic_outputs")
+REPORT_DIR.mkdir(exist_ok=True)
+
+def _row(label, metrics_dict):
+    # enforce column order and fill missing keys with NaN
+    cols = ["rmse","mae","r2","accuracy@0.5","precision@0.5","recall@0.5","f1@0.5","roc_auc"]
+    row = {"model": label}
+    for c in cols:
+        row[c] = metrics_dict.get(c, float('nan'))
+    return row
+
+# collect TEST rows if present
+test_rows = []
+for label, varname in [
+    ("LinearRegression", "m_lin_test"),
+    ("MLP",              "m_mlp_test"),
+    ("LSTM",             "m_lstm_test"),
+    ("GRU",              "m_gru_test"),
+]:
+    if varname in globals():
+        test_rows.append(_row(label, globals()[varname]))
+    else:
+        print(f"[info] TEST missing for {label} ({varname})")
+
+# collect VAL rows if present
+val_rows = []
+for label, varname in [
+    ("LinearRegression", "m_lin_val"),
+    ("MLP",              "m_mlp_val"),
+    ("LSTM",             "m_lstm_val"),
+    ("GRU",              "m_gru_val"),
+]:
+    if varname in globals():
+        val_rows.append(_row(label, globals()[varname]))
+    else:
+        print(f"[info] VAL  missing for {label} ({varname})")
+
+# build dataframes
+def _to_df(rows):
+    if rows:
+        df = pd.DataFrame(rows).set_index("model")
+        return df[["rmse","mae","r2","accuracy@0.5","precision@0.5","recall@0.5","f1@0.5","roc_auc"]]
+    else:
+        return pd.DataFrame(columns=["rmse","mae","r2","accuracy@0.5","precision@0.5","recall@0.5","f1@0.5","roc_auc"])
+
+df_test = _to_df(test_rows)
+df_val  = _to_df(val_rows)
+
+# pretty print in notebook
+print("\n=== RESULTS: TEST METRICS ===")
+display(df_test.round(4))
+
+print("\n=== RESULTS: VALIDATION (VAL) METRICS ===")
+display(df_val.round(4))
+
+# combined with suffixes for saving/sharing
+combined = df_test.add_suffix("_test").join(df_val.add_suffix("_val"), how="outer")
+
+# rank helpers 
+if not df_test.empty:
+    df_test["rank_rmse"] = df_test["rmse"].rank(method="min", ascending=True)
+    df_test["rank_f1"]   = df_test["f1@0.5"].rank(method="min", ascending=False)
+
+# save artifacts
+csv_path  = REPORT_DIR / "results_report_combined.csv"
+html_path = REPORT_DIR / "results_report_combined.html"
+combined.round(4).to_csv(csv_path)
+
+# HTML export
+( combined.round(4)
+    .style.set_caption("Model Results (Test & Validation)")
+    .background_gradient(subset=[c for c in combined.columns if c.endswith("_test")], cmap="Blues")
+    .background_gradient(subset=[c for c in combined.columns if c.endswith("_val")],  cmap="Greens")
+    .format("{:.4f}")
+    .to_html(html_path)
+)
+
+print(f"\nSaved results to:\n - {csv_path}\n - {html_path}")
+
+# bar chart for key metrics if you want a visual
+try:
+    ax = df_test[["rmse","f1@0.5","roc_auc"]].round(4).plot.bar(title="Model Performance (TEST)")
+    ax.set_ylabel("Score")
+except Exception as e:
+    print(f"[info] Skipping bar chart: {e}")
+
+[info] TEST missing for LinearRegression (m_lin_test)
+
+=== RESULTS: TEST METRICS ===
+rmse	mae	r2	accuracy@0.5	precision@0.5	recall@0.5	f1@0.5	roc_auc
+model								
+MLP	0.3801	0.2696	0.3900	0.7933	0.82	0.5942	0.6891	0.8468
+LSTM	0.4934	0.4924	-0.0277	0.6145	0.00	0.0000	0.0000	0.5520
+GRU	0.4884	0.4845	-0.0070	0.6145	0.00	0.0000	0.0000	0.6047
+
+=== RESULTS: VALIDATION (VAL) METRICS ===
+rmse	mae	r2	accuracy@0.5	precision@0.5	recall@0.5	f1@0.5	roc_auc
+model								
+LinearRegression	0.3929	0.2871	0.3479	0.7762	0.7255	0.6727	0.6981	0.8354
+MLP	0.3618	0.2389	0.4469	0.8392	0.8478	0.7091	0.7723	0.8458
+LSTM	0.4929	0.4919	-0.0264	0.6154	0.0000	0.0000	0.0000	0.6063
+GRU	0.4866	0.4827	-0.0003	0.6154	0.0000	0.0000	0.0000	0.6782
+
+Saved results to:
+ - titanic_outputs\results_report_combined.csv
+ - titanic_outputs\results_report_combined.html
