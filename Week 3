@@ -1,0 +1,362 @@
+# Module 3
+
+# 1. Setup & Import
+import os, sys, numpy as np, pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,
+    confusion_matrix, RocCurveDisplay, classification_report
+)
+from sklearn.inspection import permutation_importance
+from itertools import product
+
+# === Update this path for your local machine ===
+DATA_PATH = r"C:\Users\prj89\OneDrive\Desktop\Academics\NU\ANA 500 Python for Data Science\Week 1\titanic Dataset.csv"
+RANDOM_STATE = 42
+
+print("Using DATA_PATH:", DATA_PATH)
+
+import re, sys
+from IPython import get_ipython
+
+def find_target_assignments():
+    ip = get_ipython()
+    found = []
+    # Jupyter keeps cell inputs in In[1], In[2], ...
+    for i, src in enumerate(ip.user_ns.get('In', [])):
+        if not isinstance(src, str):
+            continue
+        for m in re.finditer(r'^\s*target\s*=\s*[\'"]([^\'"]+)[\'"]\s*$', src, flags=re.M):
+            found.append((i, m.group(1), src.strip()))
+    if not found:
+        print("No explicit `target = '...'` assignment found in executed cells.")
+    else:
+        print("Target assignments found (cell#, value, line):")
+        for i, val, line in found:
+            print(f"  In[{i}]: target = '{val}'   |  {line}")
+
+find_target_assignments()
+
+# 2. Load
+DATA_PATH = r"C:\Users\prj89\OneDrive\Desktop\Academics\NU\ANA 500 Python for Data Science\Week 1\titanic Dataset.csv"
+RANDOM_STATE = 42
+
+if not os.path.exists(DATA_PATH):
+    raise FileNotFoundError(
+        f"Could not find data file at:\n{DATA_PATH}\n\n"
+        "Please update DATA_PATH above to your local Titanic CSV."
+    )
+
+df_raw = pd.read_csv(DATA_PATH)
+print("Raw shape:", df_raw.shape)
+display(df_raw.head())
+
+# 3. Sanitize
+df_raw['Survived'] = pd.to_numeric(df_raw['Survived'], errors='coerce')
+
+# Keep only rows with valid labels (0 or 1)
+before = len(df_raw)
+df_raw = df_raw[df_raw['Survived'].isin([0, 1])]
+after = len(df_raw)
+
+print(f"Dropped {before - after} rows with missing/invalid Survived labels.")
+print("Survived value counts:\n", df_raw['Survived'].value_counts(dropna=False))
+
+# 4. Check
+import pandas as pd
+
+DATA_PATH = r"C:\Users\prj89\OneDrive\Desktop\Academics\NU\ANA 500 Python for Data Science\Week 1\titanic Dataset.csv"
+
+df_raw = pd.read_csv(DATA_PATH)
+print(df_raw.shape)
+df_raw.head()
+
+expected_cols = [
+    'Survived', 'Pclass', 'Name', 'Sex', 'Age', 'SibSp',
+    'Parch', 'Ticket', 'Fare', 'Cabin', 'Embarked'
+]
+missing = [c for c in expected_cols if c not in df_raw.columns]
+if missing:
+    raise KeyError(f"Missing expected column(s): {missing}. "
+                   "Ensure your CSV has standard Titanic headers.")
+else:
+    print("All expected columns present.")
+
+
+label_map = {
+    'yes': 1, 'y': 1, 'true': 1, 't': 1, '1': 1,
+    'no': 0,  'n': 0, 'false': 0, 'f': 0, '0': 0,
+    'nan': None, '': None
+}
+
+# Normalize strings, then map; if not a string label, keep original
+sr = df_raw['Survived'].astype(str).str.strip().str.lower()
+mapped = sr.map(label_map)
+df_raw['Survived'] = mapped.where(mapped.notna(), df_raw['Survived'])
+
+# Coerce to numeric; anything weird becomes NaN
+df_raw['Survived'] = pd.to_numeric(df_raw['Survived'], errors='coerce')
+
+# Keep only rows with valid labels 0/1
+before = len(df_raw)
+df_raw = df_raw[df_raw['Survived'].isin([0, 1])].copy()
+after = len(df_raw)
+
+print(f"Dropped {before - after} rows with missing/invalid Survived labels.")
+print("Survived value counts:\n", df_raw['Survived'].value_counts(dropna=False))
+
+# Safe to make it integer now
+df_raw['Survived'] = df_raw['Survived'].astype(int)
+
+# 5. Cleaning
+df = df_raw.copy()
+
+# Impute Embarked with mode
+if df['Embarked'].isna().any():
+    df['Embarked'] = df['Embarked'].fillna(df['Embarked'].mode().iloc[0])
+
+# Age imputation: median by (Pclass, Sex)
+df['Age'] = pd.to_numeric(df['Age'], errors='coerce')
+df['Age'] = df.groupby(['Pclass', 'Sex'])['Age'].transform(lambda s: s.fillna(s.median()))
+
+# Fare impute (if any)
+if df['Fare'].isna().any():
+    df['Fare'] = df['Fare'].fillna(df['Fare'].median())
+
+# Engineered features
+df['FamilySize'] = df['SibSp'].astype(int) + df['Parch'].astype(int) + 1
+df['IsAlone'] = (df['FamilySize'] == 1).astype(int)
+
+# Target & features
+target = 'Survived'
+feature_cols = ['Pclass','Sex','Age','SibSp','Parch','Fare','Embarked','FamilySize','IsAlone']
+
+X = df[feature_cols].copy()
+y = df[target].astype(int)   # safe now
+
+print("X shape:", X.shape, "y shape:", y.shape)
+
+try:
+    print("Current target variable:", target)
+    print("y dtype:", y.dtype, "| y unique:", sorted(pd.Series(y).unique()))
+except NameError as e:
+    print("Not set yet -> run the cleaning/feature cells first:", e)
+
+# Force Survived as target and validate
+target = 'Survived'
+
+# If you pick explicit predictors:
+feature_cols = ['Pclass','Sex','Age','SibSp','Parch','Fare','Embarked','FamilySize','IsAlone']
+X = df[feature_cols].copy()
+
+# Clean/validate target
+df['Survived'] = pd.to_numeric(df['Survived'], errors='coerce')
+df = df[df['Survived'].isin([0,1])].copy()
+y = df['Survived'].astype(int)
+
+# Guardrail: fail fast if someone reassigns target later
+def _assert_target_is_survived(y_series):
+    assert set(y_series.unique()).issubset({0,1}), "y must be binary 0/1 for Survived."
+_assert_target_is_survived(y)
+
+# 6. Train & Test
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
+)
+print("Train/Test:", X_train.shape, X_test.shape)
+
+# 7. Preprocess
+
+# Define which columns are numeric vs categorical before preprocessing
+numeric_features = ['Age', 'SibSp', 'Parch', 'Fare', 'FamilySize', 'IsAlone']
+categorical_features = ['Pclass', 'Sex', 'Embarked']
+
+try:
+    cat_ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)  # sklearn >=1.2
+except TypeError:
+    cat_ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)         # sklearn <1.2
+
+numeric_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+
+categorical_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("onehot", cat_ohe)
+])
+
+preprocess = ColumnTransformer(
+    transformers=[
+        ("num", numeric_transformer, numeric_features),
+        ("cat", categorical_transformer, categorical_features),
+    ]
+)
+
+# Fit/transform once to validate
+_ = preprocess.fit(X_train, y_train)
+Xt_train = preprocess.transform(X_train)
+Xt_test = preprocess.transform(X_test)
+
+print("Transformed train type:", type(Xt_train), "shape:", Xt_train.shape)
+print("NaNs in Xt_train:", np.isnan(Xt_train).sum(), "NaNs in Xt_test:", np.isnan(Xt_test).sum())
+
+# 8. Models
+# Logisitc Regression
+
+log_reg = Pipeline(steps=[
+    ("prep", preprocess),
+    ("model", LogisticRegression(max_iter=2000, random_state=RANDOM_STATE))
+])
+
+param_grid_lr = {
+    "model__C": [0.1, 1.0, 10.0],
+    "model__penalty": ["l2"],
+    "model__solver": ["lbfgs", "liblinear"]
+}
+
+grid_lr = GridSearchCV(
+    log_reg, param_grid_lr, cv=5, n_jobs=-1, scoring="f1"
+)
+grid_lr.fit(X_train, y_train)
+
+y_pred_lr = grid_lr.predict(X_test)
+y_proba_lr = grid_lr.predict_proba(X_test)[:, 1]
+
+print("\n=== Logistic Regression ===")
+print("Best params:", grid_lr.best_params_)
+print("Accuracy:",  accuracy_score(y_test, y_pred_lr))
+print("Precision:", precision_score(y_test, y_pred_lr))
+print("Recall:",    recall_score(y_test, y_pred_lr))
+print("F1:",        f1_score(y_test, y_pred_lr))
+print("ROC-AUC:",   roc_auc_score(y_test, y_proba_lr))
+print("\nClassification report (LR):\n", classification_report(y_test, y_pred_lr))
+
+# SVM
+
+svm_clf = Pipeline(steps=[
+    ("prep", preprocess),
+    ("model", SVC(kernel="rbf", probability=True, random_state=RANDOM_STATE))
+])
+
+param_grid_svm = {
+    "model__C": [0.5, 1, 2, 5],
+    "model__gamma": ["scale", 0.1, 0.01, 0.001],
+}
+
+grid_svm = GridSearchCV(
+    svm_clf, param_grid_svm, cv=5, n_jobs=-1, scoring="f1"
+)
+grid_svm.fit(X_train, y_train)
+
+y_pred_svm = grid_svm.predict(X_test)
+y_proba_svm = grid_svm.predict_proba(X_test)[:, 1]
+
+print("\n=== SVM (RBF) ===")
+print("Best params:", grid_svm.best_params_)
+print("Accuracy:",  accuracy_score(y_test, y_pred_svm))
+print("Precision:", precision_score(y_test, y_pred_svm))
+print("Recall:",    recall_score(y_test, y_pred_svm))
+print("F1:",        f1_score(y_test, y_pred_svm))
+print("ROC-AUC:",   roc_auc_score(y_test, y_proba_svm))
+print("\nClassification report (SVM):\n", classification_report(y_test, y_pred_svm))
+
+y_pred_lr = grid_lr.predict(X_test)
+y_pred_svm = grid_svm.predict(X_test)
+
+# 9. Confusion Matrices
+def plot_cm(y_true, y_pred, title):
+    cm = confusion_matrix(y_true, y_pred)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    im = ax.imshow(cm, interpolation='nearest')
+    ax.set_title(title)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Actual")
+    ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
+    for i, j in product(range(cm.shape[0]), range(cm.shape[1])):
+        ax.text(j, i, cm[i, j], ha="center", va="center")
+    plt.tight_layout()
+    plt.show()
+
+plot_cm(y_test, y_pred_lr, "Confusion Matrix — Logistic Regression")
+plot_cm(y_test, y_pred_svm, "Confusion Matrix — SVM (RBF)")
+
+#  10. ROC Curves
+fig, ax = plt.subplots(figsize=(6, 5))
+RocCurveDisplay.from_predictions(y_test, y_proba_lr,  name="Logistic Regression", ax=ax)
+RocCurveDisplay.from_predictions(y_test, y_proba_svm, name="SVM (RBF)",           ax=ax)
+ax.set_title("ROC Curves — Test Set")
+plt.tight_layout()
+plt.show()
+
+#  11. Logisitic Coefficients
+ohe = grid_lr.best_estimator_.named_steps['prep'].named_transformers_['cat'].named_steps['onehot']
+cat_input_features = ['Pclass','Sex','Embarked']
+ohe_features = ohe.get_feature_names_out(input_features=cat_input_features)
+num_features = ['Age','SibSp','Parch','Fare','FamilySize','IsAlone']
+all_features = np.concatenate([num_features, ohe_features])
+
+coefs = grid_lr.best_estimator_.named_steps['model'].coef_.ravel()
+coef_df = pd.DataFrame({'feature': all_features, 'coef': coefs}).sort_values('coef', ascending=False)
+
+print("Top + coefficients:")
+display(coef_df.head(12))
+print("Top - coefficients:")
+display(coef_df.tail(12))
+
+# 12. Permutation Importance
+f1_lr = f1_score(y_test, y_pred_lr)
+f1_svm = f1_score(y_test, y_pred_svm)
+
+if f1_lr >= f1_svm:
+    best = grid_lr.best_estimator_
+    best_name = "Logistic Regression"
+else:
+    best = grid_svm.best_estimator_
+    best_name = "SVM (RBF)"
+
+print("Using best model for permutation importance:", best_name)
+
+r = permutation_importance(best, X_test, y_test, n_repeats=10, random_state=RANDOM_STATE, n_jobs=-1)
+pi_df = pd.DataFrame({
+    "feature": X_test.columns,
+    "importance_mean": r.importances_mean,
+    "importance_std": r.importances_std
+}).sort_values("importance_mean", ascending=False)
+
+display(pi_df.head(15))
+
+# 13. Summary
+
+summary = pd.DataFrame([
+    {"model":"LogisticRegression", **{
+        "accuracy":  accuracy_score(y_test, y_pred_lr),
+        "precision": precision_score(y_test, y_pred_lr),
+        "recall":    recall_score(y_test, y_pred_lr),
+        "f1":        f1_score(y_test, y_pred_lr),
+        "roc_auc":   roc_auc_score(y_test, y_proba_lr),
+        "best_params": str(grid_lr.best_params_)
+    }},
+    {"model":"SVM (RBF)", **{
+        "accuracy":  accuracy_score(y_test, y_pred_svm),
+        "precision": precision_score(y_test, y_pred_svm),
+        "recall":    recall_score(y_test, y_pred_svm),
+        "f1":        f1_score(y_test, y_pred_svm),
+        "roc_auc":   roc_auc_score(y_test, y_proba_svm),
+        "best_params": str(grid_svm.best_params_)
+    }}
+])
+
+display(summary)
+
+out_csv = r"C:\Users\prj89\OneDrive\Desktop\Academics\NU\ANA 500 Python for Data Science\Week 3\Assignment3_model_summary.csv"
+summary.to_csv(out_csv, index=False)
+print("Saved summary to:", out_csv)
