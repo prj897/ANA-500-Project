@@ -1,0 +1,328 @@
+# 0) Setup & Imports (code-only)
+from pathlib import Path
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+pd.set_option("display.max_columns", 50)
+
+
+# 1) Load the Titanic Dataset (robust loaders)
+# Tries your OneDrive CSV first, then local fallbacks, then seaborn sample.
+ABS_TITANIC = Path(r"C:\Users\prj89\OneDrive\Desktop\Academics\NU\ANA 500 Python for Data Science\Week 1\titanic Dataset.csv")
+
+def load_titanic():
+    # 1) Your OneDrive absolute path
+    if ABS_TITANIC.exists():
+        print(f"Loaded CSV via OneDrive path: {ABS_TITANIC}")
+        return pd.read_csv(ABS_TITANIC)
+
+    # 2) Local fallbacks relative to current working directory
+    local_candidates = [
+        Path("./titanic.csv"),
+        Path("./titanic Dataset.csv"),
+        Path("./data/titanic.csv"),
+        Path("./datasets/titanic.csv"),
+    ]
+    for p in local_candidates:
+        if p.exists():
+            print(f"Loaded local CSV: {p}")
+            return pd.read_csv(p)
+
+    # 3) seaborn sample dataset (if available)
+    try:
+        import seaborn as sns  # used only for loading data; not for plotting
+        df = sns.load_dataset("titanic")
+        print("Loaded Titanic via seaborn.load_dataset('titanic')")
+        return df
+    except Exception as e:
+        print("Could not load via seaborn:", e)
+
+    # 4) Friendly error if nothing found
+    raise FileNotFoundError(
+        "Titanic dataset not found.\n"
+        "- Place a CSV named 'titanic.csv' next to the notebook, or\n"
+        "- Ensure seaborn is installed to use sns.load_dataset('titanic'), or\n"
+        "- Update ABS_TITANIC to a valid path."
+    )
+
+df_raw = load_titanic()
+
+# 2) Quick Overview & Data Quality Checks
+print("Shape:", df_raw.shape)
+print("\nColumns:")
+print(df_raw.columns.tolist())
+
+print("\nDtypes:")
+print(df_raw.dtypes)
+
+print("\nPreview:")
+display(df_raw.head())
+
+# Duplicate count
+dup_count = df_raw.duplicated().sum()
+print("\nDuplicate rows:", dup_count)
+
+# Missingness
+missing_counts = df_raw.isna().sum().sort_values(ascending=False)
+missing_pct = (df_raw.isna().mean().sort_values(ascending=False) * 100).round(2)
+missing_df = pd.DataFrame({"missing_count": missing_counts, "missing_%": missing_pct})
+display(missing_df)
+
+# Class balance (if 'survived' present)
+if "survived" in df_raw.columns:
+    print("\nSurvival rate (raw):")
+    print(df_raw["survived"].value_counts(normalize=True).rename("proportion"))
+
+
+# 3) Cleaning Strategy & Implementation
+df = df_raw.copy()
+
+# 3.1 Drop exact duplicates
+before = len(df)
+df = df.drop_duplicates()
+after = len(df)
+print(f"Dropped duplicates: {before - after}")
+
+# 3.2 Standardize column names
+df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
+
+# 3.3 Normalize types safely
+# pclass → numeric nullable Int64, later treated as category for grouping
+if "pclass" in df.columns:
+    df["pclass"] = pd.to_numeric(df["pclass"], errors="coerce").astype("Int64")
+
+# survived → handle common textual encodings, coerce to Int64
+if "survived" in df.columns:
+    if df["survived"].dtype == "object":
+        _sv_map = {
+            "yes": 1, "y": 1, "true": 1, "t": 1, "1": 1,
+            "no": 0, "n": 0, "false": 0, "f": 0, "0": 0
+        }
+        df["survived"] = (
+            df["survived"].astype(str).str.strip().str.lower().map(_sv_map).astype("Int64")
+        )
+    else:
+        df["survived"] = pd.to_numeric(df["survived"], errors="coerce").astype("Int64")
+
+# sex / embarked as categories if present
+for col in ["sex", "embarked"]:
+    if col in df.columns:
+        df[col] = df[col].astype("category")
+
+# Align pclass vs class naming variants
+if "pclass" in df.columns:
+    pclass_col = "pclass"
+elif "class" in df.columns:  # if using seaborn dataset
+    pclass_col = "class"
+else:
+    pclass_col = None
+
+# 3.4 Imputations
+# Age: median by (sex, pclass) then global median
+if "age" in df.columns:
+    df["age"] = pd.to_numeric(df["age"], errors="coerce")
+    if ("sex" in df.columns) and (pclass_col is not None):
+        grp_med_age = df.groupby(["sex", pclass_col])["age"].transform("median")
+        df["age"] = df["age"].fillna(grp_med_age)
+    df["age"] = df["age"].fillna(df["age"].median())
+
+# Embarked: fill with mode if any non-null exists
+if "embarked" in df.columns and df["embarked"].notna().any():
+    df["embarked"] = df["embarked"].fillna(df["embarked"].mode().iloc[0])
+
+# Fare: median by pclass if available; otherwise global median
+if "fare" in df.columns:
+    df["fare"] = pd.to_numeric(df["fare"], errors="coerce")
+    if pclass_col is not None:
+        df["fare"] = df["fare"].fillna(df.groupby(pclass_col)["fare"].transform("median"))
+    df["fare"] = df["fare"].fillna(df["fare"].median())
+
+# 3.5 Feature engineering
+if {"sibsp", "parch"}.issubset(df.columns):
+    df["sibsp"] = pd.to_numeric(df["sibsp"], errors="coerce").fillna(0).astype("Int64")
+    df["parch"] = pd.to_numeric(df["parch"], errors="coerce").fillna(0).astype("Int64")
+    df["family_size"] = (df["sibsp"].fillna(0) + df["parch"].fillna(0) + 1).astype("Int64")
+    df["is_alone"] = (df["family_size"] == 1).astype("Int64")
+
+if "age" in df.columns:
+    df["age_band"] = pd.cut(
+        df["age"],
+        bins=[-np.inf, 12, 18, 30, 50, 65, np.inf],
+        labels=["child", "teen", "young_adult", "adult", "middle_aged", "senior"]
+    )
+
+# 3.6 Outlier capping (IQR) for fare (and age as example)
+def iqr_clip(s: pd.Series) -> pd.Series:
+    q1, q3 = s.quantile([0.25, 0.75])
+    iqr = q3 - q1
+    low, high = q1 - 1.5*iqr, q3 + 1.5*iqr
+    return s.clip(lower=low, upper=high)
+
+if "fare" in df.columns:
+    df["fare_capped"] = iqr_clip(df["fare"])
+if "age" in df.columns:
+    df["age_capped"] = iqr_clip(df["age"])
+
+# 3.7 Final dtype nudges for grouping
+if "pclass" in df.columns:
+    df["pclass"] = df["pclass"].astype("category")
+
+print("\nMissing after cleaning (top 12):")
+print(df.isna().sum().sort_values(ascending=False).head(12))
+
+print("\nDtypes (top 12):")
+print(df.dtypes.head(12))
+
+# 4) Visualizations (Matplotlib only)
+
+# 4.1 Missingness bar
+missing_pct_after = (df.isna().mean().sort_values(ascending=False) * 100).round(2)
+fig = plt.figure()
+missing_pct_after.plot(kind="bar")
+plt.title("Missingness by Column (%)")
+plt.ylabel("Percent Missing")
+plt.xlabel("Column")
+plt.xticks(rotation=45, ha="right")
+plt.tight_layout()
+plt.show()
+
+# Helpers for safe plots
+def safe_hist(series, bins=30, title=""):
+    fig = plt.figure()
+    plt.hist(series.dropna(), bins=bins)
+    plt.title(title or f"Distribution: {series.name}")
+    plt.xlabel(series.name)
+    plt.ylabel("Frequency")
+    plt.tight_layout()
+    plt.show()
+
+def safe_bar(series, title=""):
+    counts = series.value_counts(dropna=False)
+    fig = plt.figure()
+    counts.plot(kind="bar")
+    plt.title(title or f"Counts: {series.name}")
+    plt.xlabel(series.name)
+    plt.ylabel("Count")
+    plt.tight_layout()
+    plt.show()
+
+# 4.2 Distributions for numerics
+for col in ["age", "fare", "fare_capped"]:
+    if col in df.columns:
+        safe_hist(df[col], bins=30, title=f"Distribution: {col}")
+
+# 4.3 Bar charts for categoricals
+for col in ["sex", "pclass", "embarked", "age_band"]:
+    if col in df.columns:
+        safe_bar(df[col], title=f"Counts: {col}")
+
+# 5) Survival Rate Analysis (Sex × Pclass)
+def show_rate_by(col):
+    out = df.groupby(col)["survived"].mean()
+    print(f"\nSurvival rate by {col}:\n", out.sort_values(ascending=False).round(3))
+    ax = out.plot(kind="bar", title=f"Survival Rate by {col}")
+    plt.xlabel(col); plt.ylabel("Survival Rate"); plt.ylim(0, 1)
+    plt.tight_layout(); plt.show()
+    return out
+
+# By Sex
+if {"survived", "sex"}.issubset(df.columns):
+    sr_sex = show_rate_by("sex")
+
+# By Passenger Class
+if {"survived", "pclass"}.issubset(df.columns):
+    sr_pclass = show_rate_by("pclass")
+
+# Combined pivot: Sex × Pclass
+if {"survived", "sex", "pclass"}.issubset(df.columns):
+    pivot = pd.pivot_table(df, values="survived", index="sex", columns="pclass", aggfunc="mean")
+    print("\nPivot: Survival rate by Sex × Pclass\n", pivot.round(3))
+    ax = pivot.T.plot(kind="bar", title="Survival Rate by Pclass (grouped by Sex)")
+    plt.xlabel("Pclass"); plt.ylabel("Survival Rate"); plt.legend(title="Sex"); plt.ylim(0, 1)
+    plt.tight_layout(); plt.show()
+
+# 6) SQL Analysis (SQLite, Lesson 4 style)
+import sqlite3
+
+DB_PATH = "titanic_demo.db"
+conn = sqlite3.connect(DB_PATH)
+
+# Save cleaned frame
+df.to_sql("titanic", conn, if_exists="replace", index=False)
+
+# Create a view for convenient analysis (build string to avoid nested triple quotes)
+sql_view = (
+    "DROP VIEW IF EXISTS fact_titanic;"
+    "CREATE VIEW fact_titanic AS "
+    "SELECT "
+    "  CAST(survived AS INT) AS survived, "
+    "  CAST(pclass   AS INT) AS pclass, "
+    "  sex, "
+    "  embarked, "
+    "  age, "
+    "  fare, "
+    "  family_size, "
+    "  is_alone "
+    "FROM titanic;"
+)
+conn.executescript(sql_view)
+
+def sql_df(q):
+    out = pd.read_sql(q, conn)
+    display(out)
+    return out
+
+print("SQLite database ready at:", DB_PATH)
+
+# Overall survival rate
+sql_df(
+    "SELECT COUNT(*) AS n_rows, "
+    "ROUND(AVG(CASE WHEN survived=1 THEN 1.0 ELSE 0.0 END), 3) AS survival_rate "
+    "FROM fact_titanic;"
+)
+
+# Survival by Sex
+sql_df(
+    "SELECT sex, "
+    "ROUND(AVG(CASE WHEN survived=1 THEN 1.0 ELSE 0.0 END), 3) AS survival_rate, "
+    "COUNT(*) AS n "
+    "FROM fact_titanic "
+    "GROUP BY sex "
+    "ORDER BY survival_rate DESC;"
+)
+
+# Survival by Pclass
+sql_df(
+    "SELECT pclass, "
+    "ROUND(AVG(CASE WHEN survived=1 THEN 1.0 ELSE 0.0 END), 3) AS survival_rate, "
+    "COUNT(*) AS n "
+    "FROM fact_titanic "
+    "GROUP BY pclass "
+    "ORDER BY pclass;"
+)
+
+# Survival by Sex × Pclass (long form)
+pivot_like = sql_df(
+    "SELECT sex, pclass, "
+    "ROUND(AVG(CASE WHEN survived=1 THEN 1.0 ELSE 0.0 END), 3) AS survival_rate, "
+    "COUNT(*) AS n "
+    "FROM fact_titanic "
+    "GROUP BY sex, pclass "
+    "ORDER BY sex, pclass;"
+)
+
+conn.close()
+
+# Plot from SQL result
+try:
+    plot_df = pivot_like.pivot(index="pclass", columns="sex", values="survival_rate").sort_index()
+    ax = plot_df.plot(kind="bar", title="Survival Rate by Pclass (grouped by Sex) — from SQL")
+    plt.xlabel("Passenger Class"); plt.ylabel("Survival Rate"); plt.legend(title="Sex"); plt.ylim(0, 1)
+    plt.tight_layout(); plt.show()
+except Exception as e:
+    print("Plot from SQL result skipped:", e)
+
